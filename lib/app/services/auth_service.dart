@@ -1,0 +1,493 @@
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import '../utils/app_logger.dart';
+
+/// Wraps Firebase Phone Auth + the Firestore `users` collection so
+/// controllers never touch the Firebase SDKs directly (and can be tested
+/// against a fake implementation instead).
+abstract class AuthService {
+  /// Starts Firebase's phone verification for [e164Phone] (e.g. "+923001234567").
+  /// Calls [onCodeSent] with the verification id once the SMS goes out, or
+  /// [onError] if Firebase rejects the number / send attempt.
+  Future<void> sendOtp({
+    required String e164Phone,
+    required void Function(String verificationId) onCodeSent,
+    required void Function(String message) onError,
+  });
+
+  /// Confirms the code the resident typed and signs them in, returning the
+  /// Firebase Auth uid.
+  Future<String> confirmOtp({required String verificationId, required String smsCode});
+
+  /// Fires with the uid when Android verifies the number by itself (instant
+  /// verification, or reading the SMS) and signs the resident in before
+  /// they type the code. The OTP screen finishes sign-in when it fires.
+  Stream<String> get autoVerifiedSignIns;
+
+  /// The uid Android signed in for the last [sendOtp], if it already has —
+  /// for an OTP screen that opens after it happened.
+  String? get autoVerifiedUid;
+
+  /// Whether a resident already exists for this phone number, and whether
+  /// it is the admin's number — routes sign-up vs. login vs. the admin side.
+  Future<PhoneLookup> lookupPhone(String e164Phone);
+
+  /// Makes the signed-in ADMIN_PHONE account the admin. Throws for any
+  /// other number.
+  Future<void> claimAdminRole();
+
+  /// Whether the signed-in account is the admin.
+  Future<bool> isAdmin();
+
+  /// Fires when Firebase signs this device out on its own — the account was
+  /// blocked (or deleted) elsewhere — but not for a [signOut] call.
+  Stream<void> get forcedSignOuts;
+
+  /// Creates the resident's Firestore profile after their first successful
+  /// sign-up verification. [cnic] is optional — Sign Up may not always
+  /// collect it — and is stored as supplied (FR-01.1: identity verification).
+  Future<void> createResidentProfile({
+    required String uid,
+    required String name,
+    required String phone,
+    String? cnic,
+  });
+
+  /// Reads the signed-in resident's Firestore profile (FR-08), or null if
+  /// there's no document yet.
+  Future<Map<String, dynamic>?> fetchResidentProfile(String uid);
+
+  /// Persists edits made on the Profile screen.
+  Future<void> updateResidentProfile({required String uid, required String name});
+
+  /// Registers this device for chat push notifications (FR-05/FR-06) by
+  /// adding its FCM token to the resident's profile — a resident may have
+  /// more than one device signed in, so tokens accumulate in a set rather
+  /// than overwriting a single field.
+  Future<void> saveFcmToken({required String uid, required String token});
+
+  /// Called on sign-out so a stale token on a shared/reset device doesn't
+  /// keep receiving another resident's notifications.
+  Future<void> removeFcmToken({required String uid, required String token});
+
+  /// Saves the choice made on the one-time "app or web?" prompt shown right
+  /// after registration (FR-09) — 'app' or 'web'. Drives whether Splash
+  /// pushes hard for FCM/push UX or keeps steering the resident back to the
+  /// web chat link.
+  Future<void> saveCommunicationPreference({required String uid, required String preference});
+
+  /// Permanently removes the resident's Firestore profile and Firebase Auth
+  /// account (FR-01.4).
+  Future<void> deleteResidentAccount(String uid);
+
+  /// Whether a resident is currently signed in — drives Splash's decision
+  /// to skip straight to Dashboard on app restart instead of Onboarding/Login.
+  bool get isSignedIn;
+
+  /// The signed-in resident's Firebase Auth uid, or null if signed out.
+  String? get currentUid;
+
+  /// The signed-in resident's verified E.164 phone number, or null if signed out.
+  String? get currentPhone;
+
+  Future<void> signOut();
+}
+
+class PhoneLookup {
+  const PhoneLookup({required this.registered, required this.isAdmin, this.blocked = false});
+
+  final bool registered;
+  final bool isAdmin;
+
+  /// Blocked by the admin: the number can't sign in.
+  final bool blocked;
+}
+
+/// Turns a [FirebaseAuthException] into something a resident (or a developer
+/// reading a snackbar) can act on. Firebase's own copy is actively misleading
+/// for the region case: a blocked SMS region reports `operation-not-allowed`
+/// with a message telling you to enable the Phone provider, even when that
+/// provider is already enabled — the real cause is only in the bracketed tail.
+String describeAuthFailure(FirebaseAuthException e) {
+  final raw = e.message ?? '';
+
+  // Firebase's server-side anti-abuse block (TOO_MANY_ATTEMPTS). Arrives as
+  // a generic "internal error" whose only clue is this bracketed code, and
+  // typically hits real numbers after heavy testing while test numbers
+  // still work. It can last 24h+ and nothing client-side lifts it.
+  if (raw.contains('Error code:39') || raw.contains('error-code:-39')) {
+    return "We can't send a code to this number right now because of too many "
+        'recent attempts. Please try again later.';
+  }
+
+  if (raw.contains('region enabled by the app developer')) {
+    return 'SMS to this country is blocked for this Firebase project. '
+        'Enable it under Authentication > Settings > SMS region policy.';
+  }
+
+  switch (e.code) {
+    case 'invalid-phone-number':
+      return "That phone number doesn't look right. Check it and try again.";
+    case 'too-many-requests':
+      return 'Too many attempts from this device — Firebase has temporarily '
+          'blocked it. Wait a while, or use a Firebase test phone number.';
+    case 'quota-exceeded':
+      return "This project's SMS quota is used up. Try again later.";
+    case 'user-disabled':
+      return 'This account has been blocked. Contact Park Vehicle if you think this is a mistake.';
+    case 'app-not-authorized':
+      return "This app build isn't authorized for phone sign-in. Check the "
+          "SHA-1/SHA-256 fingerprints registered in the Firebase console.";
+    case 'network-request-failed':
+      return 'No connection. Check your internet and try again.';
+    case 'operation-not-allowed':
+      return 'Phone sign-in is not enabled for this Firebase project.';
+    case 'web-context-cancelled':
+    case 'web-context-already-presented':
+      return 'The verification page was closed before it finished. Please try again.';
+    case 'captcha-check-failed':
+    case 'invalid-recaptcha-token':
+    case 'missing-recaptcha-token':
+    case 'invalid-recaptcha-action':
+    case 'recaptcha-not-enabled':
+      return "Couldn't complete the reCAPTCHA check. Please try again.";
+    case 'missing-client-identifier':
+    case 'invalid-app-credential':
+    case 'missing-app-credential':
+      return "This device couldn't be verified by Firebase. Please try again.";
+    default:
+      return raw.isEmpty ? 'Verification failed. Please try again.' : raw;
+  }
+}
+
+class FirebaseAuthService implements AuthService {
+  final _auth = FirebaseAuth.instance;
+  final _firestore = FirebaseFirestore.instance;
+
+  bool _signingOut = false;
+  late final Stream<void> _forcedSignOuts = () {
+    String? previousUid = _auth.currentUser?.uid;
+    return _auth.idTokenChanges().where((user) {
+      final forced = previousUid != null && user == null && !_signingOut;
+      previousUid = user?.uid;
+      if (user == null) _signingOut = false;
+      return forced;
+    }).map((_) {});
+  }();
+
+  @override
+  Stream<void> get forcedSignOuts => _forcedSignOuts;
+
+  /// Android's resend token per number, from the last `codeSent`. Without
+  /// passing it back as `forceResendingToken`, a repeat request for the
+  /// same number inside the timeout window reuses the pending verification
+  /// and no new SMS goes out — so "Resend code" silently did nothing.
+  final _resendTokens = <String, int>{};
+
+  /// Android's own sign-in for the current [sendOtp], once it starts. It
+  /// uses up the SMS code, so typing that same code afterwards is refused
+  /// as "session-expired" — [confirmOtp] then accepts this sign-in instead.
+  Future<String?>? _autoSignIn;
+  String? _pendingPhone;
+  String? _autoVerifiedUid;
+  final _autoVerified = StreamController<String>.broadcast();
+
+  @override
+  Stream<String> get autoVerifiedSignIns => _autoVerified.stream;
+
+  @override
+  String? get autoVerifiedUid => _autoVerifiedUid;
+
+  @override
+  Future<void> sendOtp({
+    required String e164Phone,
+    required void Function(String verificationId) onCodeSent,
+    required void Function(String message) onError,
+  }) async {
+    final watch = Stopwatch()..start();
+    final forced = _resendTokens.containsKey(e164Phone) ? ' (forced resend)' : '';
+    AppLogger.debug('PhoneAuth', 'verifyPhoneNumber start for $e164Phone$forced');
+    _pendingPhone = e164Phone;
+    _autoSignIn = null;
+    _autoVerifiedUid = null;
+    var codeSent = false;
+    try {
+      await _auth.verifyPhoneNumber(
+        phoneNumber: e164Phone,
+        forceResendingToken: _resendTokens[e164Phone],
+        timeout: const Duration(seconds: 60),
+        verificationCompleted: (credential) async {
+          AppLogger.debug('PhoneAuth', 'auto-verified after ${watch.elapsedMilliseconds}ms');
+          // Android verified the number itself (instant verification, or
+          // it read the SMS). Sign in now and tell the OTP screen, which
+          // finishes without the resident typing anything.
+          final signIn = _signInAutomatically(credential);
+          _autoSignIn = signIn;
+          final uid = await signIn;
+          if (uid == null || _pendingPhone != e164Phone) return;
+          _autoVerifiedUid = uid;
+          // Instant verification can skip the SMS entirely; open the OTP
+          // screen anyway so the usual post-sign-in steps run there.
+          if (!codeSent) {
+            codeSent = true;
+            onCodeSent('');
+          }
+          _autoVerified.add(uid);
+        },
+        verificationFailed: (e) {
+          _logAuthFailure('verificationFailed', e, watch);
+          onError(describeAuthFailure(e));
+        },
+        codeSent: (verificationId, resendToken) {
+          if (resendToken != null) _resendTokens[e164Phone] = resendToken;
+          if (codeSent) return;
+          codeSent = true;
+          AppLogger.debug('PhoneAuth', 'codeSent after ${watch.elapsedMilliseconds}ms');
+          onCodeSent(verificationId);
+        },
+        codeAutoRetrievalTimeout: (_) {
+          AppLogger.debug('PhoneAuth', 'auto-retrieval timed out after ${watch.elapsedMilliseconds}ms');
+        },
+      );
+    } on FirebaseAuthException catch (e) {
+      // iOS reports some failures (e.g. reCAPTCHA / app-verification
+      // problems) by throwing here rather than through verificationFailed.
+      _logAuthFailure('verifyPhoneNumber threw', e, watch);
+      onError(describeAuthFailure(e));
+    } catch (e, stack) {
+      AppLogger.debug('PhoneAuth', 'verifyPhoneNumber threw after ${watch.elapsedMilliseconds}ms: $e\n$stack');
+      onError('Verification failed. Please try again.');
+    }
+  }
+
+  void _logAuthFailure(String where, FirebaseAuthException e, Stopwatch watch) {
+    AppLogger.debug(
+      'PhoneAuth',
+      '$where after ${watch.elapsedMilliseconds}ms\n'
+      '  code: ${e.code}\n'
+      '  message: ${e.message}\n'
+      '  plugin: ${e.plugin}',
+    );
+  }
+
+  Future<String?> _signInAutomatically(PhoneAuthCredential credential) async {
+    try {
+      return (await _auth.signInWithCredential(credential)).user?.uid;
+    } catch (e) {
+      AppLogger.debug('PhoneAuth', 'auto sign-in failed: $e');
+      // The resident still completes verification manually on the OTP screen.
+      return null;
+    }
+  }
+
+  /// The uid Android already signed in for the pending number, if any.
+  Future<String?> _autoSignedInUid() async {
+    final uid = await _autoSignIn;
+    final user = _auth.currentUser;
+    if (uid == null || user == null || user.uid != uid) return null;
+    return user.phoneNumber == _pendingPhone ? uid : null;
+  }
+
+  @override
+  Future<String> confirmOtp({required String verificationId, required String smsCode}) async {
+    // Android has already signed in with this code; trying it again would
+    // only be refused as expired.
+    if (await _autoSignedInUid() case final uid?) return uid;
+    if (verificationId.isEmpty) {
+      throw FirebaseAuthException(code: 'session-expired', message: 'Request a new code.');
+    }
+    final credential = PhoneAuthProvider.credential(verificationId: verificationId, smsCode: smsCode);
+    final UserCredential result;
+    try {
+      result = await _auth.signInWithCredential(credential);
+    } on FirebaseAuthException catch (e) {
+      // Android read the SMS and used the code a moment before the
+      // resident's own attempt reached Firebase.
+      if (e.code == 'session-expired' || e.code == 'invalid-verification-code') {
+        if (await _autoSignedInUid() case final uid?) {
+          AppLogger.debug('PhoneAuth', '${e.code} — already signed in by auto-verification');
+          return uid;
+        }
+      }
+      rethrow;
+    }
+    final uid = result.user?.uid;
+    if (uid == null) throw Exception('Sign-in failed. Please try again.');
+    return uid;
+  }
+
+  @override
+  Future<PhoneLookup> lookupPhone(String e164Phone) async {
+    final watch = Stopwatch()..start();
+    try {
+      // Server-side, because users/{uid} is readable only by its owner.
+      final result = await FirebaseFunctions.instance
+          .httpsCallable('lookupPhone')
+          .call({'phone': e164Phone})
+          .timeout(const Duration(seconds: 15));
+      AppLogger.debug('PhoneAuth', 'lookupPhone took ${watch.elapsedMilliseconds}ms');
+      final data = result.data as Map;
+      return PhoneLookup(
+        registered: data['registered'] == true,
+        isAdmin: data['isAdmin'] == true,
+        blocked: data['blocked'] == true,
+      );
+    } catch (e) {
+      AppLogger.debug('PhoneAuth', 'lookupPhone failed after ${watch.elapsedMilliseconds}ms: $e');
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> claimAdminRole() async {
+    await FirebaseFunctions.instance.httpsCallable('claimAdminRole').call();
+  }
+
+  @override
+  Future<bool> isAdmin() async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) return false;
+    try {
+      final config = await _firestore.collection('config').doc('admin').get();
+      return config.data()?['uid'] == uid;
+    } on FirebaseException catch (e) {
+      // config/admin is readable only by the admin, so everyone else is
+      // refused rather than shown a different uid.
+      if (e.code == 'permission-denied') return false;
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> createResidentProfile({
+    required String uid,
+    required String name,
+    required String phone,
+    String? cnic,
+  }) async {
+    await _firestore.collection('users').doc(uid).set({
+      'name': name,
+      'phone': phone,
+      if (cnic != null && cnic.isNotEmpty) 'cnic': cnic,
+      'createdAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
+  @override
+  Future<Map<String, dynamic>?> fetchResidentProfile(String uid) async {
+    final doc = await _firestore.collection('users').doc(uid).get();
+    return doc.data();
+  }
+
+  @override
+  Future<void> updateResidentProfile({required String uid, required String name}) async {
+    await _firestore.collection('users').doc(uid).set({
+      'name': name,
+    }, SetOptions(merge: true));
+  }
+
+  @override
+  Future<void> saveFcmToken({required String uid, required String token}) async {
+    await _firestore.collection('users').doc(uid).set({
+      'fcmTokens': FieldValue.arrayUnion([token]),
+    }, SetOptions(merge: true));
+  }
+
+  @override
+  Future<void> removeFcmToken({required String uid, required String token}) async {
+    await _firestore.collection('users').doc(uid).set({
+      'fcmTokens': FieldValue.arrayRemove([token]),
+    }, SetOptions(merge: true));
+  }
+
+  @override
+  Future<void> saveCommunicationPreference({required String uid, required String preference}) async {
+    await _firestore.collection('users').doc(uid).set({
+      'communicationPreference': preference,
+    }, SetOptions(merge: true));
+  }
+
+  @override
+  Future<void> deleteResidentAccount(String uid) async {
+    // Server-side cascade: see `deleteAccount` in functions/index.js.
+    await FirebaseFunctions.instance.httpsCallable('deleteAccount').call();
+  }
+
+  @override
+  bool get isSignedIn => _auth.currentUser != null;
+
+  @override
+  String? get currentUid => _auth.currentUser?.uid;
+
+  @override
+  String? get currentPhone => _auth.currentUser?.phoneNumber;
+
+  @override
+  Future<void> signOut() {
+    _signingOut = true;
+    _autoSignIn = null;
+    _autoVerifiedUid = null;
+    _pendingPhone = null;
+    return _auth.signOut();
+  }
+}
+
+/// Phone OTP through our own Cloud Functions + local SMS gateway instead of
+/// Firebase's SMS (unreliable to Pakistani carriers, and prone to "Error
+/// code:39" blocks). The server returns a Firebase custom token, so the
+/// resident still ends up a normal Firebase Auth user with the same uid —
+/// Firestore, Storage, rules and push are all unchanged.
+///
+/// Errors are re-thrown as [FirebaseAuthException]s with the codes the OTP
+/// screen already understands, so no controller had to change.
+class CustomOtpAuthService extends FirebaseAuthService {
+  final _functions = FirebaseFunctions.instance;
+
+  @override
+  Future<void> sendOtp({
+    required String e164Phone,
+    required void Function(String verificationId) onCodeSent,
+    required void Function(String message) onError,
+  }) async {
+    final watch = Stopwatch()..start();
+    try {
+      await _functions.httpsCallable('requestPhoneOtp').call({'phone': e164Phone});
+      AppLogger.debug('PhoneAuth', 'custom OTP sent after ${watch.elapsedMilliseconds}ms');
+      // The phone number doubles as the "verification id" for confirmOtp.
+      onCodeSent(e164Phone);
+    } on FirebaseFunctionsException catch (e, stack) {
+      AppLogger.error('PhoneAuth', e, stack);
+      onError(e.message ?? 'Could not send the code. Please try again.');
+    } catch (e, stack) {
+      AppLogger.error('PhoneAuth', e, stack);
+      onError('Could not send the code. Check your connection and try again.');
+    }
+  }
+
+  @override
+  Future<String> confirmOtp({required String verificationId, required String smsCode}) async {
+    final String token;
+    try {
+      final result = await _functions.httpsCallable('verifyPhoneOtp').call({
+        'phone': verificationId,
+        'code': smsCode,
+      });
+      token = (result.data as Map)['token'] as String;
+    } on FirebaseFunctionsException catch (e) {
+      final code = switch (e.code) {
+        'permission-denied' => 'invalid-verification-code',
+        'deadline-exceeded' => 'session-expired',
+        'resource-exhausted' => 'too-many-requests',
+        _ => 'internal-error',
+      };
+      throw FirebaseAuthException(code: code, message: e.message);
+    }
+    final signedIn = await FirebaseAuth.instance.signInWithCustomToken(token);
+    final uid = signedIn.user?.uid;
+    if (uid == null) throw Exception('Sign-in failed. Please try again.');
+    return uid;
+  }
+}

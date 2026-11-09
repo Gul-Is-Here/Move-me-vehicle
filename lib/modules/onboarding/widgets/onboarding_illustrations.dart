@@ -1,0 +1,228 @@
+import 'package:flutter/material.dart';
+
+import '../../../app/theme/app_colors.dart';
+
+class OnboardingFrame extends StatelessWidget {
+  const OnboardingFrame({super.key, required this.child});
+
+  final Widget child;
+
+  /// A glowing halo of accent rings that the illustration floats in.
+  @override
+  Widget build(BuildContext context) {
+    final accent = AppColors.yellow;
+    return SizedBox(
+      width: 320,
+      height: 320,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: RadialGradient(colors: [accent.withValues(alpha: 0.20), accent.withValues(alpha: 0)]),
+            ),
+          ),
+          for (final (size, alpha) in [(300.0, 0.10), (232.0, 0.16), (164.0, 0.24)])
+            Container(
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: accent.withValues(alpha: alpha)),
+              ),
+            ),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+/// Step 1 — car silhouette with a QR sticker on the windshield.
+class TagCarIllustration extends StatelessWidget {
+  const TagCarIllustration({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return OnboardingFrame(
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          CustomPaint(size: const Size(220, 120), painter: _CarSilhouettePainter()),
+          Positioned(
+            top: 72,
+            right: 56,
+            child: Container(
+              width: 46,
+              height: 46,
+              decoration: BoxDecoration(
+                color: AppColors.yellow,
+                borderRadius: BorderRadius.circular(9),
+                boxShadow: [
+                  BoxShadow(color: AppColors.yellow.withValues(alpha: 0.32), blurRadius: 24, offset: Offset(0, 10)),
+                ],
+              ),
+              child: Icon(Icons.qr_code_2, color: AppColors.background, size: 26),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CarSilhouettePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final stroke = Paint()
+      ..color = AppColors.faint
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.4
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    final roof = Path()
+      ..moveTo(20, 90)
+      ..lineTo(34, 55)
+      ..quadraticBezierTo(40, 44, 54, 44)
+      ..lineTo(166, 44)
+      ..quadraticBezierTo(180, 44, 186, 55)
+      ..lineTo(200, 90);
+    canvas.drawPath(roof, stroke);
+
+    final body = RRect.fromRectAndRadius(const Rect.fromLTWH(10, 90, 200, 14), const Radius.circular(6));
+    canvas.drawRRect(body, Paint()..color = AppColors.surface);
+    canvas.drawRRect(body, stroke);
+
+    canvas.drawCircle(Offset(52, 104), 14, Paint()..color = AppColors.background);
+    canvas.drawCircle(const Offset(52, 104), 14, stroke);
+    canvas.drawCircle(Offset(168, 104), 14, Paint()..color = AppColors.background);
+    canvas.drawCircle(const Offset(168, 104), 14, stroke);
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(const Rect.fromLTWH(56, 52, 108, 30), const Radius.circular(4)),
+      Paint()..color = AppColors.background,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(const Rect.fromLTWH(56, 52, 108, 30), const Radius.circular(4)),
+      stroke..strokeWidth = 1.6,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Step 2 — phone with an incoming anonymous message + bell badge.
+class NotifiedIllustration extends StatelessWidget {
+  const NotifiedIllustration({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return OnboardingFrame(
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Container(
+            width: 128,
+            height: 232,
+            padding: const EdgeInsets.only(top: 16),
+            decoration: BoxDecoration(
+              color: AppColors.surface,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: AppColors.border, width: 2),
+            ),
+            child: Column(
+              children: [
+                Container(width: 34, height: 4, decoration: BoxDecoration(color: AppColors.border, borderRadius: BorderRadius.circular(2))),
+                const SizedBox(height: 22),
+                Container(
+                  width: 104,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(color: AppColors.background, borderRadius: BorderRadius.circular(12)),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Anonymous', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w600, color: AppColors.muted)),
+                      const SizedBox(height: 3),
+                      Text('Please move your car', style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: AppColors.ink)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Positioned(
+            top: 30,
+            right: 80,
+            child: Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: AppColors.yellow,
+                shape: BoxShape.circle,
+                boxShadow: [BoxShadow(color: AppColors.yellow.withValues(alpha: 0.32), blurRadius: 24, offset: Offset(0, 10))],
+              ),
+              child: Icon(Icons.notifications, color: AppColors.background, size: 17),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Step 3 — a two-bubble chat thread ending in a Resolved pill.
+class ResolveIllustration extends StatelessWidget {
+  const ResolveIllustration({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return OnboardingFrame(
+      child: SizedBox(
+        width: 220,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Align(
+              alignment: Alignment.centerLeft,
+              child: _bubble("You're blocking my exit", AppColors.surface, AppColors.ink, BorderRadius.circular(12).copyWith(bottomLeft: Radius.circular(4))),
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: _bubble('On my way!', AppColors.yellow, AppColors.background, BorderRadius.circular(12).copyWith(bottomRight: Radius.circular(4)), bold: true),
+            ),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+              decoration: BoxDecoration(
+                color: AppColors.success.withValues(alpha: 0.14),
+                border: Border.all(color: AppColors.successBorder),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.check_circle, size: 13, color: AppColors.success),
+                  const SizedBox(width: 6),
+                  Text('Resolved', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.success)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _bubble(String text, Color bg, Color fg, BorderRadius radius, {bool bold = false}) {
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 150),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(color: bg, borderRadius: radius),
+      child: Text(text, style: TextStyle(fontSize: 10.5, fontWeight: bold ? FontWeight.w700 : FontWeight.w600, color: fg)),
+    );
+  }
+}

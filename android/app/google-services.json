@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1016662892619",
+    "project_id": "move-me-vehicle",
+    "storage_bucket": "move-me-vehicle.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1016662892619:android:867660d44812d737152dce",
+        "android_client_info": {
+          "package_name": "com.parkvehicle.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAbIqycCEuvFT87jBmHn7_rzqJM34QWtM4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
