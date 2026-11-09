@@ -1,0 +1,6 @@
+node_modules/
+*.local
+# Server config values; see .env.example
+.env
+.env.*
+!.env.example
